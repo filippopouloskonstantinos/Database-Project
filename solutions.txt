@@ -1,0 +1,179 @@
+﻿DELIMITER //
+-- 3.1
+
+CREATE PROCEDURE GetMostViewedContent(
+	IN contentTypeC CHAR,
+	IN n_results INT,
+	IN dateFrom DATE,
+	IN dateTo DATE
+)
+BEGIN
+	SELECT content_id, title, content_views
+	FROM 
+		((
+			SELECT inventory_id, COUNT(*) AS content_views
+			FROM `rental` 
+			WHERE rental_date BETWEEN dateFrom AND dateTo
+			GROUP BY inventory_id 
+			ORDER BY COUNT(*) DESC
+		) AS CV
+		NATURAL JOIN inventory NATURAL JOIN content
+		)
+	WHERE content_type = if(contentTypeC='m', 'Film', 'Series')
+	LIMIT n_results;
+END//
+
+-- 3.2
+CREATE PROCEDURE TodayRentalCount(
+	IN customerEmail VARCHAR(45),
+	IN d_day DATE,
+	OUT n_rentals INT
+)
+BEGIN
+	SELECT COUNT(*) as todays_rentals INTO n_rentals
+	FROM rental 
+	WHERE DATE(rental_date)=d_day AND
+	customer_id = (SELECT customer_id FROM customer WHERE email=customerEmail LIMIT 1);
+END//
+
+-- 3.3
+CREATE PROCEDURE SalesByMonth()
+BEGIN
+	SELECT 
+		MONTHNAME(payment_date) AS `Month`, 
+		YEAR(payment_date) AS `Year`, 
+		SUM(IF(content_type='Film', amount, 0)) AS total_sales_films,
+		SUM(IF(content_type='Series', amount, 0)) AS total_sales_series
+	FROM payment NATURAL JOIN rental NATURAL JOIN inventory NATURAL JOIN content
+	GROUP BY `Year`, `Month`, MONTH(payment_date)
+	ORDER BY `Year` DESC, MONTH(payment_date) DESC;
+END//
+-- 3.4
+CREATE FULLTEXT INDEX actor_last_name_index ON actor(last_name ASC)//
+-- a
+CREATE PROCEDURE GetActorsInNameRange(
+	IN startName VARCHAR(45),
+	IN endName VARCHAR(45)
+)
+BEGIN
+	SELECT COUNT(*) 
+	FROM actor 
+	WHERE last_name BETWEEN startName AND endName 
+	ORDER BY last_name, first_name;
+	
+	SELECT first_name, last_name 
+	FROM actor 
+	WHERE last_name BETWEEN startName AND endName 
+	ORDER BY last_name, first_name;
+END//
+
+-- b
+CREATE PROCEDURE GetActorsWithLastName( 
+	IN s_lastName VARCHAR(45) 
+) 
+BEGIN 
+	DECLARE nl INT; 
+	SELECT COUNT(*) INTO nl 
+	FROM actor 
+	WHERE last_name=s_lastName ORDER BY first_name; 
+	
+	IF nl > 1 THEN 
+		SELECT nl; 
+	END IF; 
+
+	SELECT first_name, last_name 
+	FROM actor 
+	WHERE last_name=s_lastName 
+	ORDER BY first_name; 
+END//
+
+-- 4.1 Only allow root to update customer data using a trigger
+CREATE TRIGGER reject_customer_update BEFORE UPDATE ON customer
+FOR EACH ROW
+BEGIN 
+	IF SUBSTRING_INDEX(USER(),'@',1) != 'root' THEN
+		SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Only root can update customer data!';
+    END IF;
+END//
+
+-- 4.2 payment trigger
+CREATE TRIGGER create_payment AFTER INSERT ON rental
+FOR EACH ROW
+BEGIN
+	DECLARE s_type VARCHAR(12);
+    DECLARE c_type VARCHAR(12);
+    
+    SELECT subscription_type INTO @s_type 
+    FROM customer 
+    WHERE customer_id = NEW.customer_id 
+    LIMIT 1;
+    
+    SELECT content_type INTO @c_type 
+    FROM content 
+    WHERE content_id = (SELECT content_id  FROM inventory WHERE inventory_id=NEW.inventory_id LIMIT 1)
+    LIMIT 1;
+    
+    INSERT INTO payment(customer_id, rental_id, amount, payment_date) VALUES
+    (NEW.customer_id, NEW.rental_id, 
+        CASE 
+        WHEN @s_type='FILM_ONLY' 	AND @c_type='Film' 		THEN 0.40
+        WHEN @s_type='SERIES_ONLY'  AND @c_type='Series'	THEN 0.20
+        WHEN @s_type='BOTH' 		AND @c_type='Film' 		THEN 0.30
+        WHEN @s_type='BOTH' 		AND @c_type='Series' 	THEN 0.10
+     	END
+     , NEW.rental_date);
+     
+END//
+-- 4.2
+CREATE TRIGGER discount BEFORE INSERT ON payment
+FOR EACH ROW
+BEGIN 
+	DECLARE n_Rentals INT;
+    DECLARE c_email VARCHAR(45);
+    
+    SELECT email INTO @c_email FROM customer WHERE customer_id = NEW.customer_id LIMIT 1;
+    CALL TodayRentalCount(@c_email, DATE(NEW.payment_date), @n_Rentals);
+    
+    IF (@n_Rentals MOD 3 = 0) THEN
+    	SET NEW.amount = NEW.amount / 2;
+    END IF;
+END//
+
+-- 4.3 logging triggers
+CREATE TRIGGER log_rental_insert AFTER INSERT ON rental 
+FOR EACH ROW FOLLOWS create_payment
+BEGIN
+	INSERT INTO log(log_event_type, log_event_table) VALUES ('INSERT', 'RENTAL');
+END//
+
+CREATE TRIGGER log_rental_update AFTER UPDATE ON rental
+FOR EACH ROW
+BEGIN
+	INSERT INTO log(log_event_type, log_event_table) VALUES ('UPDATE', 'RENTAL');
+END//
+
+CREATE TRIGGER log_rental_delete AFTER DELETE ON rental
+FOR EACH ROW
+BEGIN
+	INSERT INTO log(log_event_type, log_event_table) VALUES ('DELETE', 'RENTAL');
+END//
+
+CREATE TRIGGER log_payment_insert AFTER INSERT ON payment 
+FOR EACH ROW
+BEGIN
+	INSERT INTO log(log_event_type, log_event_table) VALUES ('INSERT', 'PAYMENT');
+END//
+
+CREATE TRIGGER log_payment_update AFTER UPDATE ON payment
+FOR EACH ROW
+BEGIN
+	INSERT INTO log(log_event_type, log_event_table) VALUES ('UPDATE', 'PAYMENT');
+END//
+
+CREATE TRIGGER log_payment_delete AFTER DELETE ON payment
+FOR EACH ROW
+BEGIN
+	INSERT INTO log(log_event_type, log_event_table) VALUES ('DELETE', 'PAYMENT');
+END//
+
+DELIMITER ;
